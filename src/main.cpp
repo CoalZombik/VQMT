@@ -96,6 +96,9 @@ enum Metrics {
 	METRIC_SIZE
 };
 
+int float_compare (const void * a, const void * b);
+float calculate_percentil (const float* results, int nbframes, float p);
+
 int main (int argc, const char *argv[])
 {
 	// Check number of input parameters
@@ -189,8 +192,10 @@ int main (int argc, const char *argv[])
 	PSNRHVS *phvs  = new PSNRHVS(height, width);
 
 	cv::Mat original_frame(height,width,CV_32F), processed_frame(height,width,CV_32F);
-	float result[METRIC_SIZE] = {0};
-	float result_avg[METRIC_SIZE] = {0};
+	float* results[METRIC_SIZE];
+
+	for(int m=0; m<METRIC_SIZE; m++)
+		results[m] = static_cast<float*>(calloc(static_cast<size_t>(nbframes), sizeof(float)));
 
 	for (int frame=0; frame<nbframes; frame++) {
 		// Grab frame
@@ -201,51 +206,76 @@ int main (int argc, const char *argv[])
 
 		// Compute PSNR
 		if (result_file[METRIC_PSNR] != NULL) {
-			result[METRIC_PSNR] = psnr->compute(original_frame, processed_frame);
+			results[METRIC_PSNR][frame] = psnr->compute(original_frame, processed_frame);
 		}
 
 		// Compute SSIM and MS-SSIM
 		if (result_file[METRIC_SSIM] != NULL && result_file[METRIC_MSSSIM] == NULL) {
-			result[METRIC_SSIM] = ssim->compute(original_frame, processed_frame);
+			results[METRIC_SSIM][frame] = ssim->compute(original_frame, processed_frame);
 		}
 		if (result_file[METRIC_MSSSIM] != NULL) {
 			msssim->compute(original_frame, processed_frame);
 			if (result_file[METRIC_SSIM] != NULL) {
-				result[METRIC_SSIM] = msssim->getSSIM();
+				results[METRIC_SSIM][frame] = msssim->getSSIM();
 			}
-			result[METRIC_MSSSIM] = msssim->getMSSSIM();
+			results[METRIC_MSSSIM][frame] = msssim->getMSSSIM();
 		}
 
 		// Compute VIFp
 		if (result_file[METRIC_VIFP] != NULL) {
-			result[METRIC_VIFP] = vifp->compute(original_frame, processed_frame);
+			results[METRIC_VIFP][frame] = vifp->compute(original_frame, processed_frame);
 		}
 
 		// Compute PSNR-HVS and PSNR-HVS-M
 		if (result_file[METRIC_PSNRHVS] != NULL || result_file[METRIC_PSNRHVSM] != NULL) {
 			phvs->compute(original_frame, processed_frame);
 			if (result_file[METRIC_PSNRHVS] != NULL) {
-				result[METRIC_PSNRHVS] = phvs->getPSNRHVS();
+				results[METRIC_PSNRHVS][frame] = phvs->getPSNRHVS();
 			}
 			if (result_file[METRIC_PSNRHVSM] != NULL) {
-				result[METRIC_PSNRHVSM] = phvs->getPSNRHVSM();
+				results[METRIC_PSNRHVSM][frame] = phvs->getPSNRHVSM();
 			}
 		}
 
 		// Print quality index to file
 		for (int m=0; m<METRIC_SIZE; m++) {
 			if (result_file[m] != NULL) {
-				result_avg[m] += result[m];
-				fprintf(result_file[m], "%d,%.6f\n", frame, static_cast<double>(result[m]));
+				fprintf(result_file[m], "%d,%.6f\n", frame, static_cast<double>(results[m][frame]));
 			}
 		}
 	}
 
-	// Print average quality index to file
+	// Calcuate and print statistics to file
 	for (int m=0; m<METRIC_SIZE; m++) {
 		if (result_file[m] != NULL) {
-			result_avg[m] /= static_cast<float>(nbframes);
-			fprintf(result_file[m], "average,%.6f", static_cast<double>(result_avg[m]));
+			float avg = 0;
+			float stddev = 0;
+
+			for(int frame=0; frame<nbframes; frame++)
+				avg += results[m][frame];
+			avg /= static_cast<float>(nbframes);
+			
+			for(int frame=0; frame<nbframes; frame++) {
+				float diff = results[m][frame] - avg;
+				stddev += diff * diff;
+			}
+			stddev = sqrtf(stddev / static_cast<float>(nbframes - 1));
+
+			qsort(results[m], static_cast<size_t>(nbframes), sizeof(float), float_compare);
+			float p50 = calculate_percentil(results[m], nbframes, 0.50f);
+			float p90 = calculate_percentil(results[m], nbframes, 0.90f);
+			float p95 = calculate_percentil(results[m], nbframes, 0.95f);
+			float p99 = calculate_percentil(results[m], nbframes, 0.99f);
+
+
+			fprintf(result_file[m], "average,%.6f\n", static_cast<double>(avg));
+			fprintf(result_file[m], "standard deviation,%.6f\n", static_cast<double>(stddev));
+			fprintf(result_file[m], "50th percentile,%.6f\n", static_cast<double>(p50));
+			fprintf(result_file[m], "90th percentile,%.6f\n", static_cast<double>(p90));
+			fprintf(result_file[m], "95th percentile,%.6f\n", static_cast<double>(p95));
+			fprintf(result_file[m], "99th percentile,%.6f\n", static_cast<double>(p99));
+
+			free(static_cast<void*>(results[m]));
 			fclose(result_file[m]);
 		}
 	}
@@ -263,4 +293,23 @@ int main (int argc, const char *argv[])
 	printf("Time: %0.3fs\n", duration);
 
 	return EXIT_SUCCESS;
+}
+
+int float_compare (const void * a, const void * b)
+{
+	float diff = *(static_cast<const float*>(a)) - *(static_cast<const float*>(b));
+	if(diff < 0)
+		return -1;
+	if(diff > 0)
+		return 1;
+	return 0;
+}
+
+float calculate_percentil (const float* results, int nbframes, float p)
+{
+	float index = static_cast<float>(nbframes) * p;
+	float roundindex = roundf(index);
+	if(fabsf(index - roundindex) < FLT_EPSILON)
+		return (results[static_cast<int>(roundindex)] + results[static_cast<int>(roundindex + 1)]) / 2;
+	return results[static_cast<int>(roundindex)];
 }
